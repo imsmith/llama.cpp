@@ -33,7 +33,6 @@ jobs:
       - name: Determine version
         id: version
         run: |
-          # Use tag if present, otherwise commit count + short hash
           if [[ "$GITHUB_REF" == refs/tags/b* ]]; then
             VERSION="${GITHUB_REF#refs/tags/b}"
           else
@@ -48,44 +47,22 @@ jobs:
         env:
           ROCM_VERSION: "7.2.2"
         run: |
-          # Add ROCm apt repository
           sudo mkdir -p --mode=0755 /etc/apt/keyrings
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | \
             gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-          # ROCm userspace SDK (no AMDGPU kernel driver needed for CI builds)
-          sudo tee /etc/apt/sources.list.d/rocm.list <<EOF
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main
-          EOF
-
-          # Pin ROCm repo packages above system packages
-          sudo tee /etc/apt/preferences.d/rocm-pin-600 <<EOF
-          Package: *
-          Pin: release o=repo.radeon.com
-          Pin-Priority: 600
-          EOF
-
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake \
-            make \
-            g++ \
-            hipcc \
-            hip-dev \
-            hip-runtime-amd \
-            rocm-device-libs \
-            libhipblas-dev \
-            librocblas-dev \
-            libcurl4-openssl-dev \
-            dpkg-dev \
-            fakeroot \
-            lintian
-
-          # Verify ROCm installation
+            cmake make g++ \
+            hipcc hip-dev hip-runtime-amd rocm-device-libs \
+            libhipblas-dev librocblas-dev \
+            libcurl4-openssl-dev dpkg-dev fakeroot lintian
           echo "--- ROCm install check ---"
           ls /opt/rocm/lib/cmake/hip-lang/ || echo "hip-lang cmake dir not found"
           /opt/rocm/bin/hipconfig --version || echo "hipconfig not found"
-          echo "--- end check ---"
 
       - name: Build llama.cpp with HIP backend
         run: |
@@ -93,7 +70,6 @@ jobs:
           export HIP_PATH=/opt/rocm
           export HIPCXX=/opt/rocm/lib/llvm/bin/clang++
           export PATH=/opt/rocm/bin:$PATH
-
           cmake -S . -B build \
             -DGGML_HIP=ON \
             -DGPU_TARGETS="${AMDGPU_TARGETS}" \
@@ -105,15 +81,21 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF
-
           cmake --build build --config Release -j$(nproc)
 
-      - name: Assemble .deb package tree
-        id: package
+      - name: Create packaging script
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          cat > /tmp/make-deb.sh <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          VERSION="$1"
+          PKG_REVISION="$2"
+          AMDGPU_TARGETS="$3"
+
           PKG_NAME="llama-cpp-hip"
           PKG_DIR="${PKG_NAME}_${VERSION}-${PKG_REVISION}_amd64"
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
 
           mkdir -p "${PKG_DIR}/DEBIAN"
           mkdir -p "${PKG_DIR}/usr/bin"
@@ -121,30 +103,28 @@ jobs:
           mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
           mkdir -p "${PKG_DIR}/usr/lib/systemd/system"
 
-          # --- discover EVERYTHING the build produced ---
-          echo "=== all files in build/bin/ ==="
+          # --- discover build output ---
+          echo "=== build/bin/ ==="
           ls -la build/bin/ 2>/dev/null || echo "no build/bin/"
-          echo "=== all .so files in build/ ==="
+          echo "=== .so files in build/ ==="
           find build/ -name '*.so*' | sort
-          echo "=== all .a files in build/ ==="
+          echo "=== .a files in build/ ==="
           find build/ -name '*.a' | sort
-          echo "=== ldd of llama-server before packaging ==="
+          echo "=== ldd llama-server ==="
           ldd build/bin/llama-server 2>/dev/null || true
 
           # --- binaries ---
-          cp build/bin/llama-server  "${PKG_DIR}/usr/bin/"
-          cp build/bin/llama-cli     "${PKG_DIR}/usr/bin/"
-          cp build/bin/llama-bench   "${PKG_DIR}/usr/bin/"
-
+          cp build/bin/llama-server "${PKG_DIR}/usr/bin/"
+          cp build/bin/llama-cli "${PKG_DIR}/usr/bin/"
+          cp build/bin/llama-bench "${PKG_DIR}/usr/bin/"
           for tool in llama-quantize llama-gguf llama-cvector-generator; do
             [ -f "build/bin/${tool}" ] && cp "build/bin/${tool}" "${PKG_DIR}/usr/bin/"
           done
 
-          # --- shared libraries: grab from entire build tree ---
+          # --- shared libraries ---
           find build/ -name '*.so*' -type f -exec cp {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
           find build/ -name '*.so*' -type l -exec cp -a {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
 
-          # --- show what we captured ---
           echo "=== packaged binaries ==="
           ls -la "${PKG_DIR}/usr/bin/"
           echo "=== packaged libraries ==="
@@ -152,18 +132,12 @@ jobs:
 
           # --- docs ---
           cp LICENSE "${PKG_DIR}/usr/share/doc/${PKG_NAME}/copyright"
-          cat > "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian" <<EOF
-          ${PKG_NAME} (${VERSION}-${PKG_REVISION}) unstable; urgency=low
-
-            * Automated build from upstream commit $(git rev-parse --short HEAD)
-            * ROCm HIP backend targeting ${AMDGPU_TARGETS}
-
-           -- GitHub Actions <ci@localhost>  $(date -R)
-          EOF
-          gzip -9 "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian"
+          printf '%s (%s-%s) unstable; urgency=low\n\n  * Build from commit %s\n  * ROCm HIP targeting %s\n\n -- GitHub Actions <ci@localhost>  %s\n' \
+            "${PKG_NAME}" "${VERSION}" "${PKG_REVISION}" "${COMMIT_SHORT}" "${AMDGPU_TARGETS}" "$(date -R)" \
+            | gzip -9 > "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian.gz"
 
           # --- systemd unit ---
-          cat > "${PKG_DIR}/usr/lib/systemd/system/llama-server.service" <<'EOF'
+          cat > "${PKG_DIR}/usr/lib/systemd/system/llama-server.service" <<EOF
           [Unit]
           Description=llama.cpp inference server
           After=network.target
@@ -172,14 +146,10 @@ jobs:
           Type=simple
           User=llama
           Group=llama
-          ExecStart=/usr/bin/llama-server \
-              --host 0.0.0.0 \
-              --port 8080
+          ExecStart=/usr/bin/llama-server --host 0.0.0.0 --port 8080
           Restart=on-failure
           RestartSec=5s
           LimitNOFILE=65536
-
-          # Hardening
           ProtectSystem=strict
           ProtectHome=read-only
           PrivateTmp=true
@@ -192,7 +162,7 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-          # --- control file ---
+          # --- control ---
           INSTALLED_SIZE=$(du -sk "${PKG_DIR}" | cut -f1)
           cat > "${PKG_DIR}/DEBIAN/control" <<EOF
           Package: ${PKG_NAME}
@@ -214,361 +184,71 @@ jobs:
            .
            Requires ROCm HIP runtime and /dev/kfd (AMDGPU kernel driver).
            .
-           Built from upstream commit $(git rev-parse --short HEAD).
+           Built from upstream commit ${COMMIT_SHORT}.
           EOF
 
-          # --- postinst: create service user and verify GPU ---
+          # --- postinst ---
           cat > "${PKG_DIR}/DEBIAN/postinst" <<'EOF'
           #!/bin/sh
           set -e
-
-          # Create service user
           if ! getent passwd llama >/dev/null 2>&1; then
-              adduser --system --group --home /var/lib/llama \
-                  --no-create-home --shell /usr/sbin/nologin llama
-              usermod -aG video,render llama
+            adduser --system --group --home /var/lib/llama \
+              --no-create-home --shell /usr/sbin/nologin llama
+            usermod -aG video,render llama
           fi
-
           ldconfig
-
-          # Verify GPU access
           echo ""
           echo "=== llama-cpp-hip: post-install GPU check ==="
-
           if [ ! -e /dev/kfd ]; then
-              echo "WARNING: /dev/kfd not found."
-              echo "  The AMDGPU kernel driver does not appear to be loaded."
-              echo "  llama-server will fall back to CPU (much slower)."
-              echo "  Install the amdgpu-dkms package and reboot, or verify"
-              echo "  your GPU is supported."
+            echo "WARNING: /dev/kfd not found."
+            echo "  The AMDGPU kernel driver does not appear to be loaded."
+            echo "  llama-server will fall back to CPU (much slower)."
+            echo "  Install the amdgpu-dkms package and reboot."
           elif command -v rocminfo >/dev/null 2>&1; then
-              GPU_COUNT=$(rocminfo 2>/dev/null | grep -c "Marketing Name" || true)
-              if [ "$GPU_COUNT" -gt 0 ]; then
-                  echo "OK: rocminfo found ${GPU_COUNT} GPU device(s)."
-                  rocminfo 2>/dev/null | grep "Marketing Name" | sed 's/^/  /'
-              else
-                  echo "WARNING: rocminfo ran but found no GPU devices."
-                  echo "  Check that your user is in the video and render groups."
-              fi
+            GPU_COUNT=$(rocminfo 2>/dev/null | grep -c "Marketing Name" || true)
+            if [ "$GPU_COUNT" -gt 0 ]; then
+              echo "OK: rocminfo found ${GPU_COUNT} GPU device(s)."
+              rocminfo 2>/dev/null | grep "Marketing Name" | sed 's/^/  /'
+            else
+              echo "WARNING: rocminfo ran but found no GPU devices."
+              echo "  Check that your user is in the video and render groups."
+            fi
           else
-              echo "NOTE: rocminfo not installed (apt install rocminfo)."
-              echo "  /dev/kfd is present, so the kernel driver is loaded."
-              echo "  Install rocminfo to verify GPU detection."
+            echo "NOTE: rocminfo not installed (apt install rocminfo)."
+            echo "  /dev/kfd is present, so the kernel driver is loaded."
           fi
-
           echo "=== end GPU check ==="
           echo ""
           EOF
           chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
 
-          # --- postrm: clean up ldconfig cache ---
-          cat > "${PKG_DIR}/DEBIAN/postrm" <<'EOF'
-          #!/bin/sh
-          set -e
-          ldconfig
-          EOF
+          # --- postrm ---
+          printf '#!/bin/sh\nset -e\nldconfig\n' > "${PKG_DIR}/DEBIAN/postrm"
           chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
 
           # --- conffiles ---
-          echo "/usr/lib/systemd/system/llama-server.service" \
-            > "${PKG_DIR}/DEBIAN/conffiles"
+          echo "/usr/lib/systemd/system/llama-server.service" > "${PKG_DIR}/DEBIAN/conffiles"
 
-          # --- build the .deb ---
+          # --- build ---
           fakeroot dpkg-deb --build "${PKG_DIR}"
 
-          echo "deb_file=${PKG_DIR}.deb" >> "$GITHUB_OUTPUT"
-          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "deb_file=${PKG_DIR}.deb"
+          echo "pkg_name=${PKG_NAME}"
+          SCRIPT
+          chmod +x /tmp/make-deb.sh
 
-      - name: Lint the package
-        run: |
-          lintian --no-tag-display-limit "${{ steps.package.outputs.deb_file }}" || true
-
-      - name: Upload .deb artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ steps.package.outputs.pkg_name }}-${{ steps.version.outputs.version }}
-          path: ${{ steps.package.outputs.deb_file }}
-          retention-days: 90
-
-      - name: Attach .deb to release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: ${{ steps.package.outputs.deb_file }}name: Build llama.cpp .deb (ROCm HIP / gfx1151)
-
-on:
-  workflow_dispatch:
-    inputs:
-      gpu_targets:
-        description: "AMDGPU targets (semicolon-separated)"
-        default: "gfx1151"
-        required: false
-      package_revision:
-        description: "Debian package revision (e.g. 1)"
-        default: "1"
-        required: false
-  push:
-    tags:
-      - "b*"
-
-env:
-  AMDGPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1151' }}
-  PKG_REVISION: ${{ github.event.inputs.package_revision || '1' }}
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
-jobs:
-  build-deb:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Determine version
-        id: version
-        run: |
-          # Use tag if present, otherwise commit count + short hash
-          if [[ "$GITHUB_REF" == refs/tags/b* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/b}"
-          else
-            COUNT=$(git rev-list --count HEAD)
-            SHORT=$(git rev-parse --short HEAD)
-            VERSION="${COUNT}+git${SHORT}"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Building version: ${VERSION}"
-
-      - name: Install ROCm SDK and build dependencies
-        env:
-          ROCM_VERSION: "7.2.2"
-        run: |
-          # Add ROCm apt repository
-          sudo mkdir -p --mode=0755 /etc/apt/keyrings
-          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | \
-            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-          # ROCm userspace SDK (no AMDGPU kernel driver needed for CI builds)
-          sudo tee /etc/apt/sources.list.d/rocm.list <<EOF
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main
-          EOF
-
-          # Pin ROCm repo packages above system packages
-          sudo tee /etc/apt/preferences.d/rocm-pin-600 <<EOF
-          Package: *
-          Pin: release o=repo.radeon.com
-          Pin-Priority: 600
-          EOF
-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake \
-            make \
-            g++ \
-            hipcc \
-            hip-dev \
-            hip-runtime-amd \
-            rocm-device-libs \
-            libhipblas-dev \
-            librocblas-dev \
-            libcurl4-openssl-dev \
-            dpkg-dev \
-            fakeroot \
-            lintian
-
-          # Verify ROCm installation
-          echo "--- ROCm install check ---"
-          ls /opt/rocm/lib/cmake/hip-lang/ || echo "hip-lang cmake dir not found"
-          /opt/rocm/bin/hipconfig --version || echo "hipconfig not found"
-          echo "--- end check ---"
-
-      - name: Build llama.cpp with HIP backend
-        run: |
-          export ROCM_PATH=/opt/rocm
-          export HIP_PATH=/opt/rocm
-          export HIPCXX=/opt/rocm/lib/llvm/bin/clang++
-          export PATH=/opt/rocm/bin:$PATH
-
-          cmake -S . -B build \
-            -DGGML_HIP=ON \
-            -DGPU_TARGETS="${AMDGPU_TARGETS}" \
-            -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
-            -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLAMA_CURL=ON \
-            -DCMAKE_INSTALL_PREFIX=/usr \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_BUILD_EXAMPLES=OFF
-
-          cmake --build build --config Release -j$(nproc)
-
-      - name: Assemble .deb package tree
+      - name: Assemble .deb package
         id: package
         run: |
+          /tmp/make-deb.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${PKG_REVISION}" \
+            "${AMDGPU_TARGETS}" \
+            | tee /tmp/pkg-output.txt
           VERSION="${{ steps.version.outputs.version }}"
-          PKG_NAME="llama-cpp-hip"
-          PKG_DIR="${PKG_NAME}_${VERSION}-${PKG_REVISION}_amd64"
-
-          mkdir -p "${PKG_DIR}/DEBIAN"
-          mkdir -p "${PKG_DIR}/usr/bin"
-          mkdir -p "${PKG_DIR}/usr/lib/x86_64-linux-gnu"
-          mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
-          mkdir -p "${PKG_DIR}/usr/lib/systemd/system"
-
-          # --- discover what the build produced ---
-          echo "=== all .so files in build/ ==="
-          find build/ -name '*.so*' | sort
-          echo "=== all executables in build/bin/ ==="
-          ls build/bin/ 2>/dev/null || echo "no build/bin/"
-
-          # --- binaries ---
-          cp build/bin/llama-server  "${PKG_DIR}/usr/bin/"
-          cp build/bin/llama-cli     "${PKG_DIR}/usr/bin/"
-          cp build/bin/llama-bench   "${PKG_DIR}/usr/bin/"
-
-          for tool in llama-quantize llama-gguf llama-cvector-generator; do
-            [ -f "build/bin/${tool}" ] && cp "build/bin/${tool}" "${PKG_DIR}/usr/bin/"
-          done
-
-          # --- shared libraries: grab every .so from the entire build tree ---
-          find build/ -name '*.so*' -type f -exec cp {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
-          find build/ -name '*.so*' -type l -exec cp -a {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
-
-          # --- show what we captured ---
-          echo "=== packaged binaries ==="
-          ls -la "${PKG_DIR}/usr/bin/"
-          echo "=== packaged libraries ==="
-          ls -la "${PKG_DIR}/usr/lib/x86_64-linux-gnu/"
-
-          # --- docs ---
-          cp LICENSE "${PKG_DIR}/usr/share/doc/${PKG_NAME}/copyright"
-          cat > "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian" <<EOF
-          ${PKG_NAME} (${VERSION}-${PKG_REVISION}) unstable; urgency=low
-
-            * Automated build from upstream commit $(git rev-parse --short HEAD)
-            * ROCm HIP backend targeting ${AMDGPU_TARGETS}
-
-           -- GitHub Actions <ci@localhost>  $(date -R)
-          EOF
-          gzip -9 "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian"
-
-          # --- systemd unit ---
-          cat > "${PKG_DIR}/usr/lib/systemd/system/llama-server.service" <<'EOF'
-          [Unit]
-          Description=llama.cpp inference server
-          After=network.target
-
-          [Service]
-          Type=simple
-          User=llama
-          Group=llama
-          ExecStart=/usr/bin/llama-server \
-              --host 0.0.0.0 \
-              --port 8080
-          Restart=on-failure
-          RestartSec=5s
-          LimitNOFILE=65536
-
-          # Hardening
-          ProtectSystem=strict
-          ProtectHome=read-only
-          PrivateTmp=true
-          NoNewPrivileges=true
-          DeviceAllow=/dev/kfd rw
-          DeviceAllow=/dev/dri/* rw
-          SupplementaryGroups=video render
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          # --- control file ---
-          INSTALLED_SIZE=$(du -sk "${PKG_DIR}" | cut -f1)
-          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
-          Package: ${PKG_NAME}
-          Version: ${VERSION}-${PKG_REVISION}
-          Section: science
-          Priority: optional
-          Architecture: amd64
-          Installed-Size: ${INSTALLED_SIZE}
-          Depends: libcurl4 (>= 7.0), libstdc++6, libc6, rocm-hip-runtime
-          Recommends: rocm-device-libs, rocminfo
-          Maintainer: Ian Smith <ian@imsmith.github.io>
-          Homepage: https://github.com/imsmith/llama.cpp
-          Description: llama.cpp with ROCm HIP backend (${AMDGPU_TARGETS})
-           LLM inference engine compiled with AMD ROCm HIP support
-           targeting ${AMDGPU_TARGETS} (Strix Halo / Radeon 8060S).
-           .
-           Includes llama-server (OpenAI-compatible API), llama-cli,
-           llama-bench, and supporting shared libraries.
-           .
-           Requires ROCm HIP runtime and /dev/kfd (AMDGPU kernel driver).
-           .
-           Built from upstream commit $(git rev-parse --short HEAD).
-          EOF
-
-          # --- postinst: create service user and verify GPU ---
-          cat > "${PKG_DIR}/DEBIAN/postinst" <<'EOF'
-          #!/bin/sh
-          set -e
-
-          # Create service user
-          if ! getent passwd llama >/dev/null 2>&1; then
-              adduser --system --group --home /var/lib/llama \
-                  --no-create-home --shell /usr/sbin/nologin llama
-              usermod -aG video,render llama
-          fi
-
-          ldconfig
-
-          # Verify GPU access
-          echo ""
-          echo "=== llama-cpp-hip: post-install GPU check ==="
-
-          if [ ! -e /dev/kfd ]; then
-              echo "WARNING: /dev/kfd not found."
-              echo "  The AMDGPU kernel driver does not appear to be loaded."
-              echo "  llama-server will fall back to CPU (much slower)."
-              echo "  Install the amdgpu-dkms package and reboot, or verify"
-              echo "  your GPU is supported."
-          elif command -v rocminfo >/dev/null 2>&1; then
-              GPU_COUNT=$(rocminfo 2>/dev/null | grep -c "Marketing Name" || true)
-              if [ "$GPU_COUNT" -gt 0 ]; then
-                  echo "OK: rocminfo found ${GPU_COUNT} GPU device(s)."
-                  rocminfo 2>/dev/null | grep "Marketing Name" | sed 's/^/  /'
-              else
-                  echo "WARNING: rocminfo ran but found no GPU devices."
-                  echo "  Check that your user is in the video and render groups."
-              fi
-          else
-              echo "NOTE: rocminfo not installed (apt install rocminfo)."
-              echo "  /dev/kfd is present, so the kernel driver is loaded."
-              echo "  Install rocminfo to verify GPU detection."
-          fi
-
-          echo "=== end GPU check ==="
-          echo ""
-          EOF
-          chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
-
-          # --- postrm: clean up ldconfig cache ---
-          cat > "${PKG_DIR}/DEBIAN/postrm" <<'EOF'
-          #!/bin/sh
-          set -e
-          ldconfig
-          EOF
-          chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
-
-          # --- conffiles ---
-          echo "/usr/lib/systemd/system/llama-server.service" \
-            > "${PKG_DIR}/DEBIAN/conffiles"
-
-          # --- build the .deb ---
-          fakeroot dpkg-deb --build "${PKG_DIR}"
-
+          PKG_DIR="llama-cpp-hip_${VERSION}-${PKG_REVISION}_amd64"
           echo "deb_file=${PKG_DIR}.deb" >> "$GITHUB_OUTPUT"
-          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=llama-cpp-hip" >> "$GITHUB_OUTPUT"
 
       - name: Lint the package
         run: |
