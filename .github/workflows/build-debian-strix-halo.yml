@@ -115,19 +115,30 @@ jobs:
           mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
           mkdir -p "${PKG_DIR}/usr/lib/systemd/system"
 
+          # --- discover what the build produced ---
+          echo "=== all .so files in build/ ==="
+          find build/ -name '*.so*' | sort
+          echo "=== all executables in build/bin/ ==="
+          ls build/bin/ 2>/dev/null || echo "no build/bin/"
+
           # --- binaries ---
           cp build/bin/llama-server  "${PKG_DIR}/usr/bin/"
           cp build/bin/llama-cli     "${PKG_DIR}/usr/bin/"
           cp build/bin/llama-bench   "${PKG_DIR}/usr/bin/"
 
-          # Any additional tools worth keeping
           for tool in llama-quantize llama-gguf llama-cvector-generator; do
             [ -f "build/bin/${tool}" ] && cp "build/bin/${tool}" "${PKG_DIR}/usr/bin/"
           done
 
-          # --- shared libraries ---
-          cp build/lib/*.so*  "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
-          cp build/ggml/src/libggml*.so* "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+          # --- shared libraries: grab every .so from the entire build tree ---
+          find build/ -name '*.so*' -type f -exec cp {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
+          find build/ -name '*.so*' -type l -exec cp -a {} "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" \;
+
+          # --- show what we captured ---
+          echo "=== packaged binaries ==="
+          ls -la "${PKG_DIR}/usr/bin/"
+          echo "=== packaged libraries ==="
+          ls -la "${PKG_DIR}/usr/lib/x86_64-linux-gnu/"
 
           # --- docs ---
           cp LICENSE "${PKG_DIR}/usr/share/doc/${PKG_NAME}/copyright"
