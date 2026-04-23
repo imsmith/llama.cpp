@@ -53,10 +53,9 @@ jobs:
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | \
             gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
 
-          # ROCm packages and AMDGPU driver
+          # ROCm userspace SDK (no AMDGPU kernel driver needed for CI builds)
           sudo tee /etc/apt/sources.list.d/rocm.list <<EOF
           deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main
-          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/${ROCM_VERSION}/ubuntu noble main
           EOF
 
           # Pin ROCm repo packages above system packages
@@ -181,8 +180,8 @@ jobs:
           Priority: optional
           Architecture: amd64
           Installed-Size: ${INSTALLED_SIZE}
-          Depends: libcurl4 (>= 7.0), libstdc++6, libc6
-          Recommends: rocm-device-libs
+          Depends: libcurl4 (>= 7.0), libstdc++6, libc6, rocm-hip-runtime
+          Recommends: rocm-device-libs, rocminfo
           Maintainer: Ian Smith <ian@imsmith.github.io>
           Homepage: https://github.com/imsmith/llama.cpp
           Description: llama.cpp with ROCm HIP backend (${AMDGPU_TARGETS})
@@ -192,19 +191,52 @@ jobs:
            Includes llama-server (OpenAI-compatible API), llama-cli,
            llama-bench, and supporting shared libraries.
            .
+           Requires ROCm HIP runtime and /dev/kfd (AMDGPU kernel driver).
+           .
            Built from upstream commit $(git rev-parse --short HEAD).
           EOF
 
-          # --- postinst: create service user ---
+          # --- postinst: create service user and verify GPU ---
           cat > "${PKG_DIR}/DEBIAN/postinst" <<'EOF'
           #!/bin/sh
           set -e
+
+          # Create service user
           if ! getent passwd llama >/dev/null 2>&1; then
               adduser --system --group --home /var/lib/llama \
                   --no-create-home --shell /usr/sbin/nologin llama
               usermod -aG video,render llama
           fi
+
           ldconfig
+
+          # Verify GPU access
+          echo ""
+          echo "=== llama-cpp-hip: post-install GPU check ==="
+
+          if [ ! -e /dev/kfd ]; then
+              echo "WARNING: /dev/kfd not found."
+              echo "  The AMDGPU kernel driver does not appear to be loaded."
+              echo "  llama-server will fall back to CPU (much slower)."
+              echo "  Install the amdgpu-dkms package and reboot, or verify"
+              echo "  your GPU is supported."
+          elif command -v rocminfo >/dev/null 2>&1; then
+              GPU_COUNT=$(rocminfo 2>/dev/null | grep -c "Marketing Name" || true)
+              if [ "$GPU_COUNT" -gt 0 ]; then
+                  echo "OK: rocminfo found ${GPU_COUNT} GPU device(s)."
+                  rocminfo 2>/dev/null | grep "Marketing Name" | sed 's/^/  /'
+              else
+                  echo "WARNING: rocminfo ran but found no GPU devices."
+                  echo "  Check that your user is in the video and render groups."
+              fi
+          else
+              echo "NOTE: rocminfo not installed (apt install rocminfo)."
+              echo "  /dev/kfd is present, so the kernel driver is loaded."
+              echo "  Install rocminfo to verify GPU detection."
+          fi
+
+          echo "=== end GPU check ==="
+          echo ""
           EOF
           chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
 
