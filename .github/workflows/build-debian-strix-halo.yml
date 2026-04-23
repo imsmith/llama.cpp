@@ -18,13 +18,14 @@ on:
 env:
   AMDGPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1151' }}
   PKG_REVISION: ${{ github.event.inputs.package_revision || '1' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-deb:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: recursive
@@ -44,37 +45,56 @@ jobs:
           echo "Building version: ${VERSION}"
 
       - name: Install ROCm SDK and build dependencies
+        env:
+          ROCM_VERSION: "7.2.2"
         run: |
           # Add ROCm apt repository
-          sudo mkdir -p /etc/apt/keyrings
+          sudo mkdir -p --mode=0755 /etc/apt/keyrings
           wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | \
             gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
 
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
-            https://repo.radeon.com/rocm/apt/6.4.3 noble main" | \
-            sudo tee /etc/apt/sources.list.d/rocm.list
+          # ROCm packages and AMDGPU driver
+          sudo tee /etc/apt/sources.list.d/rocm.list <<EOF
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/${ROCM_VERSION}/ubuntu noble main
+          EOF
+
+          # Pin ROCm repo packages above system packages
+          sudo tee /etc/apt/preferences.d/rocm-pin-600 <<EOF
+          Package: *
+          Pin: release o=repo.radeon.com
+          Pin-Priority: 600
+          EOF
 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake \
             make \
             g++ \
-            hipcc \
-            libhipblas-dev \
-            librocblas-dev \
-            rocm-device-libs \
+            rocm-hip-sdk \
             libcurl4-openssl-dev \
             dpkg-dev \
             fakeroot \
             lintian
 
+          # Verify ROCm installation
+          echo "--- ROCm install check ---"
+          ls /opt/rocm/lib/cmake/hip-lang/ || echo "hip-lang cmake dir not found"
+          /opt/rocm/bin/hipconfig --version || echo "hipconfig not found"
+          echo "--- end check ---"
+
       - name: Build llama.cpp with HIP backend
         run: |
-          HIPCXX="$(hipconfig -l)/clang" \
-          HIP_PATH="$(hipconfig -R)" \
+          export ROCM_PATH=/opt/rocm
+          export HIP_PATH=/opt/rocm
+          export HIPCXX=/opt/rocm/lib/llvm/bin/clang++
+          export PATH=/opt/rocm/bin:$PATH
+
           cmake -S . -B build \
             -DGGML_HIP=ON \
-            -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+            -DGPU_TARGETS="${AMDGPU_TARGETS}" \
+            -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
+            -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLAMA_CURL=ON \
             -DCMAKE_INSTALL_PREFIX=/usr \
@@ -211,7 +231,7 @@ jobs:
           lintian --no-tag-display-limit "${{ steps.package.outputs.deb_file }}" || true
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.pkg_name }}-${{ steps.version.outputs.version }}
           path: ${{ steps.package.outputs.deb_file }}
@@ -219,6 +239,6 @@ jobs:
 
       - name: Attach .deb to release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.package.outputs.deb_file }}
