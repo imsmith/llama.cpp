@@ -1,0 +1,224 @@
+name: Build llama.cpp .deb (ROCm HIP / gfx1151)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_targets:
+        description: "AMDGPU targets (semicolon-separated)"
+        default: "gfx1151"
+        required: false
+      package_revision:
+        description: "Debian package revision (e.g. 1)"
+        default: "1"
+        required: false
+  push:
+    tags:
+      - "b*"
+
+env:
+  AMDGPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1151' }}
+  PKG_REVISION: ${{ github.event.inputs.package_revision || '1' }}
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Determine version
+        id: version
+        run: |
+          # Use tag if present, otherwise commit count + short hash
+          if [[ "$GITHUB_REF" == refs/tags/b* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/b}"
+          else
+            COUNT=$(git rev-list --count HEAD)
+            SHORT=$(git rev-parse --short HEAD)
+            VERSION="${COUNT}+git${SHORT}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - name: Install ROCm SDK and build dependencies
+        run: |
+          # Add ROCm apt repository
+          sudo mkdir -p /etc/apt/keyrings
+          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
+            https://repo.radeon.com/rocm/apt/6.4.3 noble main" | \
+            sudo tee /etc/apt/sources.list.d/rocm.list
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            make \
+            g++ \
+            hipcc \
+            libhipblas-dev \
+            librocblas-dev \
+            rocm-device-libs \
+            libcurl4-openssl-dev \
+            dpkg-dev \
+            fakeroot \
+            lintian
+
+      - name: Build llama.cpp with HIP backend
+        run: |
+          HIPCXX="$(hipconfig -l)/clang" \
+          HIP_PATH="$(hipconfig -R)" \
+          cmake -S . -B build \
+            -DGGML_HIP=ON \
+            -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_CURL=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+
+          cmake --build build --config Release -j$(nproc)
+
+      - name: Assemble .deb package tree
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_NAME="llama-cpp-hip"
+          PKG_DIR="${PKG_NAME}_${VERSION}-${PKG_REVISION}_amd64"
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/usr/lib/x86_64-linux-gnu"
+          mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
+          mkdir -p "${PKG_DIR}/usr/lib/systemd/system"
+
+          # --- binaries ---
+          cp build/bin/llama-server  "${PKG_DIR}/usr/bin/"
+          cp build/bin/llama-cli     "${PKG_DIR}/usr/bin/"
+          cp build/bin/llama-bench   "${PKG_DIR}/usr/bin/"
+
+          # Any additional tools worth keeping
+          for tool in llama-quantize llama-gguf llama-cvector-generator; do
+            [ -f "build/bin/${tool}" ] && cp "build/bin/${tool}" "${PKG_DIR}/usr/bin/"
+          done
+
+          # --- shared libraries ---
+          cp build/lib/*.so*  "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+          cp build/ggml/src/libggml*.so* "${PKG_DIR}/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
+
+          # --- docs ---
+          cp LICENSE "${PKG_DIR}/usr/share/doc/${PKG_NAME}/copyright"
+          cat > "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian" <<EOF
+          ${PKG_NAME} (${VERSION}-${PKG_REVISION}) unstable; urgency=low
+
+            * Automated build from upstream commit $(git rev-parse --short HEAD)
+            * ROCm HIP backend targeting ${AMDGPU_TARGETS}
+
+           -- GitHub Actions <ci@localhost>  $(date -R)
+          EOF
+          gzip -9 "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.Debian"
+
+          # --- systemd unit ---
+          cat > "${PKG_DIR}/usr/lib/systemd/system/llama-server.service" <<'EOF'
+          [Unit]
+          Description=llama.cpp inference server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=llama
+          Group=llama
+          ExecStart=/usr/bin/llama-server \
+              --host 0.0.0.0 \
+              --port 8080
+          Restart=on-failure
+          RestartSec=5s
+          LimitNOFILE=65536
+
+          # Hardening
+          ProtectSystem=strict
+          ProtectHome=read-only
+          PrivateTmp=true
+          NoNewPrivileges=true
+          DeviceAllow=/dev/kfd rw
+          DeviceAllow=/dev/dri/* rw
+          SupplementaryGroups=video render
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          # --- control file ---
+          INSTALLED_SIZE=$(du -sk "${PKG_DIR}" | cut -f1)
+          cat > "${PKG_DIR}/DEBIAN/control" <<EOF
+          Package: ${PKG_NAME}
+          Version: ${VERSION}-${PKG_REVISION}
+          Section: science
+          Priority: optional
+          Architecture: amd64
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: libcurl4 (>= 7.0), libstdc++6, libc6
+          Recommends: rocm-device-libs
+          Maintainer: Ian Smith <ian@imsmith.github.io>
+          Homepage: https://github.com/imsmith/llama.cpp
+          Description: llama.cpp with ROCm HIP backend (${AMDGPU_TARGETS})
+           LLM inference engine compiled with AMD ROCm HIP support
+           targeting ${AMDGPU_TARGETS} (Strix Halo / Radeon 8060S).
+           .
+           Includes llama-server (OpenAI-compatible API), llama-cli,
+           llama-bench, and supporting shared libraries.
+           .
+           Built from upstream commit $(git rev-parse --short HEAD).
+          EOF
+
+          # --- postinst: create service user ---
+          cat > "${PKG_DIR}/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          if ! getent passwd llama >/dev/null 2>&1; then
+              adduser --system --group --home /var/lib/llama \
+                  --no-create-home --shell /usr/sbin/nologin llama
+              usermod -aG video,render llama
+          fi
+          ldconfig
+          EOF
+          chmod 0755 "${PKG_DIR}/DEBIAN/postinst"
+
+          # --- postrm: clean up ldconfig cache ---
+          cat > "${PKG_DIR}/DEBIAN/postrm" <<'EOF'
+          #!/bin/sh
+          set -e
+          ldconfig
+          EOF
+          chmod 0755 "${PKG_DIR}/DEBIAN/postrm"
+
+          # --- conffiles ---
+          echo "/usr/lib/systemd/system/llama-server.service" \
+            > "${PKG_DIR}/DEBIAN/conffiles"
+
+          # --- build the .deb ---
+          fakeroot dpkg-deb --build "${PKG_DIR}"
+
+          echo "deb_file=${PKG_DIR}.deb" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=${PKG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Lint the package
+        run: |
+          lintian --no-tag-display-limit "${{ steps.package.outputs.deb_file }}" || true
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.pkg_name }}-${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.deb_file }}
+          retention-days: 90
+
+      - name: Attach .deb to release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.deb_file }}
