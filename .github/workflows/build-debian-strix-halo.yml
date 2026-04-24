@@ -73,7 +73,6 @@ jobs:
           cmake -S . -B build \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DGGML_HIP=ON \
-            -DGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
             -DHIP_PLATFORM=amd \
