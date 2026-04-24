@@ -70,11 +70,12 @@ jobs:
           export HIP_PATH=/opt/rocm
           export PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:$PATH
           echo "=== Building for GPU target: ${AMDGPU_TARGETS} ==="
+          /opt/rocm/bin/hipcc --version
+          echo "HIPCC=$(command -v hipcc)"
           cmake -S . -B build \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
             -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
-            -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
             -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
             -DGGML_HIP=ON \
             -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
