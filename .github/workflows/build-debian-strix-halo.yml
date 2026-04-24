@@ -74,9 +74,11 @@ jobs:
           cmake -S . -B build \
             -DGGML_HIP=ON \
             -DGPU_TARGETS="${AMDGPU_TARGETS}" \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
             -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
             -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
+            -DHIP_PLATFORM=amd \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
             -DLLAMA_CURL=ON \
