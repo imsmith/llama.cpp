@@ -71,11 +71,10 @@ jobs:
           export PATH=/opt/rocm/bin:$PATH
           echo "=== Building for GPU target: ${AMDGPU_TARGETS} ==="
           cmake -S . -B build \
-            -DCMAKE_HIP_COMPILER=/opt/rocm/bin/hipcc \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
             -DGGML_HIP=ON \
             -DGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
-            -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
             -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
             -DHIP_PLATFORM=amd \
             -DCMAKE_BUILD_TYPE=Release \
