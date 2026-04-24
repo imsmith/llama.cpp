@@ -1,11 +1,11 @@
-name: Build llama.cpp .deb (ROCm HIP / gfx1151)
+name: Build llama.cpp .deb (ROCm HIP / Strix Halo)
 
 on:
   workflow_dispatch:
     inputs:
       gpu_targets:
         description: "AMDGPU targets (semicolon-separated)"
-        default: "gfx1151"
+        default: "gfx1100"
         required: false
       package_revision:
         description: "Debian package revision (e.g. 1)"
@@ -16,7 +16,7 @@ on:
       - "b*"
 
 env:
-  AMDGPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1151' }}
+  AMDGPU_TARGETS: ${{ github.event.inputs.gpu_targets || 'gfx1100' }}
   PKG_REVISION: ${{ github.event.inputs.package_revision || '1' }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -146,6 +146,8 @@ jobs:
           Type=simple
           User=llama
           Group=llama
+          Environment=HSA_OVERRIDE_GFX_VERSION=11.0.0
+          Environment=HSA_ENABLE_SDMA=0
           ExecStart=/usr/bin/llama-server --host 0.0.0.0 --port 8080
           Restart=on-failure
           RestartSec=5s
