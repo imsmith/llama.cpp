@@ -72,6 +72,9 @@ jobs:
           echo "=== Building for GPU target: ${AMDGPU_TARGETS} ==="
           cmake -S . -B build \
             -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/bin/hipcc \
             -DGGML_HIP=ON \
             -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
