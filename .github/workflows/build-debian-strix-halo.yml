@@ -70,9 +70,11 @@ jobs:
           export HIP_PATH=/opt/rocm
           export HIPCXX=/opt/rocm/lib/llvm/bin/clang++
           export PATH=/opt/rocm/bin:$PATH
+          echo "=== Building for GPU target: ${AMDGPU_TARGETS} ==="
           cmake -S . -B build \
             -DGGML_HIP=ON \
             -DGPU_TARGETS="${AMDGPU_TARGETS}" \
+            -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
             -DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm \
             -DCMAKE_HIP_ARCHITECTURES="${AMDGPU_TARGETS}" \
             -DCMAKE_BUILD_TYPE=Release \
@@ -81,6 +83,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF
+          echo "=== Verifying target in build config ==="
+          grep -ri "gfx" build/CMakeCache.txt || true
           cmake --build build --config Release -j$(nproc)
 
       - name: Create packaging script
